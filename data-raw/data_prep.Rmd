@@ -1,0 +1,534 @@
+# Hydrometry and the Water Balance
+
+USGS has developed an R package called *dataRetrieval* [@R-dataRetrieval] which we can use to download data from their servers. All of the data available within the greater South Carolina drainage area could be relevant for this project.^[A wider area could be considered when looking for reference gages, perhaps including a portion of Delaware.(cite Feaster)] This area includes all of SC, and portions of GA, NC, and VA. It can be approximated using 4 digit HUC codes 0304, 0305, and 0306. At the time of this writing, however, the dataRetrieval package doesn't offer the functionality we need to easily query by HUCs. 
+
+So, first the data from all sites in the four states has been downloaded, then filtered to include only sites within the 3 HUC4's. With a list of HUC8s, it would be possible to batch query the USGS rest service, but that is more difficult to implement.
+  
+There are many options available with USGS' services. Two of interest cannot be used together - catalog output and expanded output. Catalog output: 
+_"...provides detailed period of record information for certain output formats. The period of record indicates date ranges for a certain kind of information about a site, for example the start and end dates for a site's daily mean streamflow."_
+  
+Expanded output: 
+_"...provides a rich set of extended site attributes such as hydrologic unit code, drainage area and site time zone."_ 
+
+*Statistics: uncertainty. It has become a common trope, when confronted with methodological problems in existing models, to respond that the stream gages have xyz amounts of uncertainty. This claim will be reviewed here.*
+
+
+Both are loaded and reviewed.
+  
+```{r download-data}
+library(dataRetrieval)
+library(tidyverse)
+
+
+site_catalog_raw <- bind_rows(
+  lapply(c("SC", "NC", "GA", "VA"), function(x) {
+    readNWISdata(stateCd = x, service = "site", 
+                 seriesCatalogOutput = TRUE) } ) ) %>%
+  mutate(huc4 = str_sub(huc_cd, end=4)) %>%
+  filter(huc4 %in% c('0304', '0305', '0306'))
+
+usethis::use_data(site_catalog_raw, overwrite=T)
+
+site_expanded_raw <- bind_rows(
+  lapply(c("SC", "NC", "GA", "VA"), function(x) {
+    readNWISdata(stateCd = x, service = 'site',
+                 siteOutput = 'expanded') %>%
+      mutate(construction_dt = as.character(construction_dt),
+         well_depth_va = as.numeric(well_depth_va),
+         hole_depth_va = as.numeric(hole_depth_va) ) } ) ) %>%
+  mutate(huc4 = str_sub(huc_cd, end=4)) %>%
+  filter(huc4 %in% c('0304', '0305', '0306'))
+
+usethis::use_data(site_expanded_raw, overwrite=T)
+```
+
+
+## USGS Monitoring Gages
+
+sites_catalog is much longer than sites_expanded because sites_catalog contains an entry for each statistic of each parameter at each site, whereas sites_expanded contains only one entry per site.
+
+Additional key tables decode certain the columns in these site tables. These key tables are available on the USGS website, and they have been combined into an Excel workbook and subsequently joined to the gage tables. 
+
+An additional table can be aggregated from the sites_catalog table: sites_parameters. This table contains one entry for each parameter measured at each site.
+
+```{r siteCodeDictionaries}
+## TODO: decode sites_expanded$instruments_cd
+
+read_dictionary <- function(sheet) {
+  readxl::read_excel('USGS_code_dictionary.xlsx', sheet=sheet) }
+
+## TODO: read the dictionary and usethis::use_data() it
+
+
+site_catalog <- site_catalog_raw %>% 
+  left_join(read_dictionary(1), by = "stat_cd") %>%
+  left_join(read_dictionary(2)[,1:3], by = "parm_cd") %>%
+  left_join(read_dictionary(3) %>%
+            dplyr::select(site_tp_cd, site_tp_ln), by = "site_tp_cd") %>%
+  mutate(begin_date = lubridate::ymd(begin_date, truncated=2),
+         end_date = lubridate::ymd(end_date, truncated=2)) %>%
+  dplyr::rename(lat=dec_lat_va, lng = dec_long_va)
+
+usethis::use_data(site_catalog, overwrite=T)
+```
+
+
+```{r}
+site_parameters <- site_catalog %>%
+  group_by(parameter_group_nm, parameter_nm, site_no) %>%
+  summarise(begin_date = min(begin_date),
+            end_date = max(end_date)) %>%
+  ungroup()
+
+usethis::use_data(site_parameters, overwrite=T)
+```
+
+```{r}
+site_expanded <- site_expanded_raw %>%
+  left_join(read_dictionary(3) %>%
+            dplyr::select(site_tp_cd, site_tp_nm, site_tp_ln, site_tp_ds), by = "site_tp_cd") %>%
+  left_join(read_dictionary(4), by = c("state_cd", "aqfr_cd")) %>%
+  left_join(read_dictionary(5), by = "aqfr_type_cd") %>%
+  left_join(read_dictionary(6), by = c("state_cd", "nat_aqfr_cd")) %>%
+  left_join(read_dictionary(7), by = "reliability_cd") %>%
+  left_join(read_dictionary(8), by = "topo_cd") %>%
+  rename(lat=dec_lat_va, lng=dec_long_va) %>%
+  mutate(id = paste0(site_no, project_no),
+         state_nm = case_when(
+           state_cd == "45" ~ "SC",
+           state_cd == "13" ~ "GA",
+           state_cd == "37" ~ "NC",
+           TRUE ~ "VA"))
+
+# row.names(site_expanded) <- site_expanded$id
+
+usethis::use_data(site_expanded, overwrite=T)
+```
+
+The monitoring gage sites are classified in to different types. The types of sites available in the greater SC watershed are described in the table below (ordered from most abundant to least):
+
+```{r site_types_summary_table, eval=F}
+gageTypeStateSummary <- site_expanded %>%
+  group_by(site_tp_ln, state_nm, site_tp_ds) %>%
+  summarise(Count = n()) %>%
+  spread(state_nm, Count, fill=0) %>%
+  mutate(Total = SC+GA+NC+VA) %>%
+  dplyr::select(`Site Type` = site_tp_ln, SC, NC, GA, VA, Total, 
+         `Description` = site_tp_ds) %>%
+  arrange(desc(Total))
+
+# saveRDS(gageTypeStateSummary,
+#         "_shinyApps//41-NWIS-AllSitesApp//TypeStateSummary.rds")
+
+# kable::kable(gageTypeStateSummary[,c(1,7)])
+
+```
+
+Here is a breakdown of the site types by states (sites not within the greater SC watershed are not included). 
+
+```{r NWIS-gageTypeStateSummary-table, eval=F}
+kable(gageTypeStateSummary[,-7])
+## Can I make the Description be a pop-up when you hover over Site Type? 
+
+# There are many well and stream sites. They will be examined in greater detail 
+# in the following pages. Below is an interactive map of the other site types.
+rm(gageTypeStateSummary)
+```
+
+
+Each monitoring site collects or has collected data for one or more parameters. When all of the sites are taken into consideration, there is an impressive variety of parameters. The parameters are listed alphabetically by group in the table below. Why are there so many NAs?
+```{r NWIS-parameterGroupSummary, eval=F}
+## Parameter Group Summary
+parameterGroups <-
+  group_by(sites_catalog, parameter_group_nm) %>%
+  summarise(`Parameter Group`=unique(parameter_group_nm),
+            Sites=length(unique(site_no)),
+            Parameters=# length(unique(parameter_nm)),
+              if(length(unique(parameter_nm))==1) {
+                unique(parameter_nm) 
+                } else {
+                  as.character(length(unique(parameter_nm)))},
+            Statistics=
+              if(length(unique(stat_desc))==1) {
+                unique(stat_desc) 
+                } else {
+                  as.character(length(unique(stat_desc)))},
+            Records=n(),
+            `Parameter List`=paste(sort(unique(parameter_nm)), 
+                                   collapse="; ")) %>%
+  ungroup() %>% select(-1)
+
+# saveRDS(parameterGroups, "41-NWIS-AllSitesApp//parameterGroups.rds")
+
+parameters <- select(site_parameters, 1,2) %>% unique()
+# saveRDS(parameters, "41-NWIS-AllSitesApp//parameters.rds")
+
+parameterGroupCatalog <- group_by(
+  site_parameters, site_no, parameter_group_nm) %>%
+  summarise(begin_date = min(begin_date), 
+            end_date=max(end_date)) %>% ungroup()
+
+# saveRDS(parameterGroupCatalog, "41-NWIS-AllSitesApp//parameterGroupCatalog.rds")
+
+kable(select(parameterGroups, -`Parameter List`))
+```
+The complete list of parameters available in the study area is 70 pages long. The physical parameters could be reviewed selectively. 
+```{r NWIS-parameterGroupSummaryTable, eval=F}
+# kable(select(parameterGroups, 1,6))
+## This prints to some 70 pages...
+
+## TODO: list and describe physical parameters
+```
+
+The table below shows the types of statistical values that are available in the catalog, and the number of time series for each type of value. (A time series is composed of one or more recorded observations over time at a given site). Why are there so many NAs?
+
+```{r NWIS-stat-summary, eval=F}
+## Stat summary
+statSummary <- group_by(sites_catalog, stat_desc) %>%
+  summarise(Records = n()) %>%
+  rename(Statistics = stat_desc)
+
+# saveRDS(statSummary, "41-NWIS-AllSitesApp//statSummary.rds")
+
+kable(statSummary)
+```
+
+
+```{r NWIS-cleanup, eval=F}
+
+## site_expanded contains 1620 rows with either missing or 
+## invalid lat/lon values and will be ignored
+# rename(lat = dec_lat_va, lng = dec_long_va)
+
+rm(# site_expanded, site_parameters, sites_catalog, 
+  parameterGroups, parameterGroupCatalog, parameters, statSummary)
+
+```
+
+
+
+
+
+## NWIS Surface Water
+
+TODO: Look at the parameters and date ranges offered by the stream gages.
+TODO: Make the Gant chart looking graph with gages and P.O.R.'s
+
+```{r NWIS-SurfaceWater-DateRange}
+
+## For the surface water app
+surfaceSites <- site_expanded %>%
+  filter(site_tp_nm %in% c("Stream", "Lake", "Tidal SW", "Estuary", "Spring")) 
+
+usethis::use_data(surfaceSites, overwrite=T)
+
+## A table summarizing the types of parameters in each state
+inner_join(site_parameters, surfaceSites[c("site_no", "state_nm")]) %>%
+  group_by(parameter_group_nm, state_nm) %>%
+  summarise(Count = n()) %>%
+  spread(state_nm, Count, fill=0) %>%
+  mutate(Total = SC+GA+NC+VA) %>%
+  arrange(desc(Total))
+# unique(x$parameter_group_nm)
+
+## A table summarizing the physical parameters in each state
+inner_join(site_parameters, surfaceSites[c("site_no", "state_nm")]) %>%
+  filter(parameter_group_nm == "Physical") %>%
+  group_by(parameter_nm, state_nm) %>%
+  summarise(Count = n()) %>%
+  spread(state_nm, Count, fill=0) %>%
+  mutate(Total = SC+GA+NC) %>%
+  arrange(desc(Total)) %>%
+  dplyr::select(
+    GA, NC, SC, Total,
+    `Physical Parameter Measured at Stream, Lake, Tidal, Estuary, or Spring Sites` = parameter_nm)
+### Make this a dynamic shiny app?
+
+```
+
+
+
+```{r USGS-DownloadSurfaceFlowData, eval=F}
+## TODO: run this chunk
+surfaceFlowSites <- semi_join(
+  surfaceSites, filter(sites_catalog, parm_cd == "00060"), by="site_no")
+
+### Download All Surface Flow Data
+for(i in 1:nrow(surfaceFlowSites)) {
+  print(i)
+  flowData <- readNWISdv(
+    siteNumber = surfaceFlowSites$site_no[i],
+    parameterCd = '00060') %>% renameNWISColumns()
+  
+  if(length(flowData) == 0) next
+  
+  if(!("Flow" %in% names(flowData)) &&
+     !("Flow_cd" %in% names(flowData) ) ) {
+    flowData %<>% rename(Flow = PUBLISHED_Flow,
+                         Flow_cd = PUBLISHED_Flow_cd ) }
+  
+  flowData %<>% dplyr::select("site_no","Date","Flow","Flow_cd")
+  
+  if(i == 1) {AllSurfaceFlowData <- flowData
+  } else {AllFlowData <- rbind(AllSurfaceFlowData, flowData) } }
+
+AllSurfaceFlowData %<>% dnr_removeNWISattributes() %>%
+  unique()
+
+usethis::use_data(AllSurfaceFlowData)
+
+## TODO: Graph it somehow.
+## TODO: The gage data availability chart
+```
+
+```{r NWIS-UpdateSurfaceFlowDate, eval=F}
+## TODO: run this chunk.
+## TODO: update provisional data
+## TODO: update Sites
+
+AllSurfaceFlowData <- readInput("AllSurfaceFlowData.rds")
+
+library(tidyverse)
+
+surfaceFlowSites <- semi_join(
+  surfaceSites, filter(sites_catalog, parm_cd == "00060"), by="site_no")
+
+surfaceFlowSites2 <- inner_join(
+  surfaceSites, 
+  filter(sites_catalog, parm_cd == "00060") %>% ##  & stat_cd=='00003'
+    select(site_no, parameter_nm, stat_name, begin_date, end_date), 
+  by="site_no")
+
+
+print("Downloading new surface flow data")
+
+for(i in 1:nrow(surfaceFlowSites)) {
+  flowData <- readNWISdv(
+    siteNumber = surfaceFlowSites$site_no[i],
+    parameterCd = '00060',
+    startDate=max(AllSurfaceFlowData$Date)+1) %>% renameNWISColumns()
+  
+  if(length(flowData) == 0) next
+  
+  if(!("Flow" %in% names(flowData)) &&
+     !("Flow_cd" %in% names(flowData) ) ) {
+    flowData %<>% rename(Flow = PUBLISHED_Flow,
+                         Flow_cd = PUBLISHED_Flow_cd ) }
+  
+  flowData %<>% dplyr::select("site_no","Date","Flow","Flow_cd")
+    if(i == 1) {newSurfaceFlowData <- flowData
+  } else {newSurfaceFlowData <- rbind(newSurfaceFlowData, flowData) } }
+
+newSurfaceFlowData %<>% dnr_removeNWISattributes() %>%
+  unique()
+
+# nrow(filter(newSurfaceFlowData, Date==today()-2))
+
+AllSurfaceFlowData <- rbind(AllSurfaceFlowData, newSurfaceFlowData)
+rm(newSurfaceFlowData, flowData)
+dnr_save(AllSurfaceFlowData, temp=TRUE)
+
+usethis::use_data(AllSurfaceFlowData)
+# usethis::use_data(sites_catalog)
+# usethis::use_data(surfaceSites)
+usethis::use_data(surfaceFlowSites)
+
+
+
+x <- select(surfaceFlowSites2, station_nm, site_no, lat, lng, 
+       state_nm, site_tp_ln, parameter_nm, stat_name, 
+       begin_date, end_date) %>%
+  filter(site_tp_ln %in% c("Stream", "Tidal stream") & 
+           stat_name=="MEAN") %>%
+  mutate(Length_Days = end_date-begin_date) 
+
+x2 <- x[duplicated(x$site_no),] %>%
+  select(site_no, begin_date, end_date, Length_Days)
+
+x3 <- left_join(x[!duplicated(x$site_no),], x2, by='site_no',
+                suffix=c('.1', '.2'))
+
+y <- filter(AllSurfaceFlowData, !is.na(Flow)) %>%
+  group_by(site_no, Flow_cd) %>%
+  summarise(days=n()) %>%
+  spread(Flow_cd, days, fill=0) %>%
+  ungroup()
+
+
+library(xlsx)
+left_join(x3, y) %>%
+  write.xlsx("Mean Daily Stream Discharge Length of Records.xlsx")
+getwd()
+
+```
+
+
+```{r NWIS-SurfaceWater-Reports, eval=FALSE }
+# dnr_load(AllSurfaceFlowData)
+
+abbrev <- function(str, pat, rep) {
+  str_replace_all(str, regex(pat, ignore_case=TRUE), rep) }
+
+reduceGageStationNames <- function(stationNames) {
+  stationNames %>%
+    abbrev('SAVANNAH RIVER SITE', 'SRS') %>%
+    
+    abbrev('  ', ' ') %>% abbrev(',SC', '') %>%
+    abbrev(',S.C.', '') %>% abbrev(', S.C.', '') %>%    
+    abbrev(', S. C.', '') %>% abbrev(' S C', '') %>% 
+    abbrev(' S. C.', '') %>% abbrev(", SC", '') %>%
+    abbrev(',GA', '') %>% abbrev(', GA', '') %>%
+    abbrev(',NC', '') %>% abbrev(', NC', '') %>%
+    
+    abbrev('SOUTH ', 'S.') %>% abbrev('NORTH ', 'N.') %>%
+    abbrev('EAST', 'E.') %>% abbrev('WEST', 'W.') %>%
+    abbrev('LITTLE', 'Lil') %>% abbrev('BIG', 'Bg') %>%
+    abbrev('UPPER', 'Upr') %>% abbrev('MIDDLE', 'Mdl') %>% 
+    abbrev('LOWER', 'Lwr') %>%
+    abbrev("NEAR", "nr") %>% abbrev(" AT ", ' @ ') %>% 
+    abbrev('ABOVE', 'Abv') %>% abbrev('BELOW', 'Blw') %>% 
+    
+    abbrev("CREEK", "Crk") %>% abbrev("RIVER", "Rvr") %>%
+    abbrev('CANAL', 'Cnl') %>% abbrev('FORD', 'Frd') %>%
+    abbrev('FORK', 'Frk') %>% abbrev('BRANCH', 'Bnch') %>% 
+    abbrev('MOUNT', 'Mt') %>% abbrev('HILL', 'Hl') %>%
+    abbrev('BEAVER', 'Bvr') %>% abbrev('TURKEY', 'Trky') %>%
+    abbrev('HEADWATER', 'Hdwtr') %>% abbrev('MOUTH', 'Mth') %>%
+    abbrev('BEACH', 'Bch') %>% abbrev('PORT', 'Prt') %>%
+    abbrev('SWAMP', 'Swmp') %>% abbrev('SHOALS', 'Shls') %>%
+    abbrev('TRIBUTARY', 'Trib') %>%
+    abbrev(' SPRINGS', 'Spr') %>% abbrev(' SPRING', 'Spr') %>%
+    abbrev('ROCKY', 'Rcky') %>% abbrev('ROCK', 'Rck') %>%
+    abbrev('GROVE', 'Grv') %>% abbrev('FOREST', 'Frst') %>%
+    abbrev('HICKORY', 'Hckry') %>% abbrev('CORNER', 'Crnr') %>%  
+    abbrev('LAKE', 'Lk') %>% abbrev('RESERVOIR', 'Res.') %>%
+    abbrev('FALLS', 'Fls') %>% abbrev('ISLAND', 'Is.') %>%
+    abbrev('AVENUE', 'Ave') %>% abbrev(' ROAD', ' Rd') %>%
+    abbrev('RAILROAD', 'RlRd') %>% abbrev('HIGHWAY', 'Hwy') %>%
+    abbrev('BOULEVARD', 'Blvd') %>% abbrev('TRAIL', 'Trl') %>%
+    abbrev('CROSSROADS', 'CrsRd') %>% abbrev('CROSSROAD', 'CrsRd') %>%
+    abbrev('BRIDGE', 'Brdg') %>% abbrev('DAM', 'Dm') %>% abbrev('TAILRACE', 'Tlrc') %>%
+    abbrev('FORT', 'Frt') %>% abbrev('VILLE', 'vl') %>%  abbrev('BURG', 'Brg') %>%
+    abbrev('MILLS', 'Mls') %>% abbrev('MILL', 'Ml') %>%
+    abbrev('PARK', 'Prk') %>%
+    
+    abbrev('FIRST', '1st') %>% abbrev('SECOND', '2nd') %>%    
+    abbrev('NINETYSIX', '96') %>% abbrev('NINETYNINE', '99') %>% abbrev('TWENTY', '20') %>%
+    abbrev('EIGHTEEN', '18') %>% abbrev('TWELVE', '12') %>% abbrev('SIX', '6') %>%
+    abbrev('FOUR', '4') %>%  abbrev('THREE', '3') %>%
+       
+    abbrev('MILE ', 'mi') %>% abbrev('GOLF COURSE', 'Golf') %>%
+    abbrev('LANDING', 'Lndng') %>% abbrev('POWERHOUSE', 'Pwrhs') %>%
+    abbrev('TREATMENT', 'Treat.') %>% abbrev(' PLANT ', ' Plnt') %>%
+    abbrev('MEDICAL', 'Med.') %>% abbrev('CENTER', 'Cntr') %>%
+    
+    abbrev('PEE DEE', 'P.D.') %>% abbrev('YADKIN', 'Yadkn') %>%
+    abbrev('SAVANNAH', 'Sav.') %>% abbrev('SITE NO. ', 'Site') %>%
+    abbrev('WINSTON-SALEM', 'Winst-Sal') %>% abbrev('ATLANTIC', 'Atlc') %>%
+    abbrev('CHARLOTTE', 'Charlt') %>% abbrev('COLUMBIA', 'Cola.')
+} # BROAD CATAWBA  WACCAMAW POCOTALIGO COOSAWHATCHIE 
+
+# surfaceSites$station_nm2 <- reduceGageStationNames(surfaceSites$station_nm)
+# 
+# surfaceSites %>%
+#   dplyr::select(station_nm2, station_nm) %>%
+#   mutate(name_length = str_length(station_nm),
+#          name_length2 = str_length(station_nm2)) %>%
+#   arrange(desc(name_length2)) -> y
+# head(y, n=25L)
+# qplot(y$name_length) ; qplot(y$name_length2)
+# rm(y)
+
+surfaceSites$station_nm <- reduceGageStationNames(surfaceSites$station_nm)
+surfaceSites$station_nm <- tools::toTitleCase(surfaceSites$station_nm)
+
+```
+
+
+```{r NWIS-multi-dimensional-table, eval=F}
+AllSurfaceFlowData <- readInput("AllSurfaceFlowData.rds")
+
+flow <- mutate(AllSurfaceFlowData,
+               `Water Year` = year(Date) + ifelse(month(Date)>9,1,0)) %>%
+  select(Site=site_no, `Water Year`, Flow)
+
+# flow %>% group_by(site_no) %>%
+#   do({mutate(., percentile=rank(Flow)/nrow(.))})
+# flow %<>% mutate(yday = yday(Date))
+# flow %<>% ungroup()
+
+flow2 <- group_by(flow, Site) %>%
+  do({movingAverages(., "Flow", 2:30) %>%
+      rename(Flow1=Flow) %>%
+      gather("Duration", Flow, Flow1:Flow30) %>%
+      mutate(Duration = as.numeric(str_sub(Duration, 5) ) ) %>%
+      group_by(Duration, `Water Year`) %>%
+      summarise(High = max(Flow, na.rm=TRUE),
+                Low = min(Flow, na.rm=TRUE) ) %>%
+      ungroup() %>%
+      gather("Type", Flow, High, Low) %>%
+      group_by(Duration, Type) %>%
+      do({mutate(., `Return Interval` = (nrow(.)+1)/
+                   ifelse(Type=='High', rank(-Flow), rank(Flow)))})
+    } ) %>% ungroup()
+
+flow2 %<>% mutate(`Exceedance Probability`=1/`Return Interval`)
+
+surfaceSites <- readInput("surfaceSites-42.rds") %>%
+  select(site_no, `Site Name`=station_nm, `Drainage Area (sqmi)` = drain_area_va)
+
+filter(flow2, Site %in% c("02109500", "02173000", "02196000", "02167582")) %>%
+         left_join(surfaceSites, by=c("Site"="site_no")) %>%
+  mutate(`CFS/sqmi` = Flow / `Drainage Area (sqmi)`) %>%
+  ggplot(aes(group=interaction(Duration, Type),
+             # y=Flow,
+    y=`CFS/sqmi`, 
+    # color=Type, 
+    # x=`Return Interval`, 
+    color=Duration, 
+    x=`Exceedance Probability`)) +
+  geom_line() +
+  scale_color_gradient(low="red", high="blue") +
+  scale_y_log10() + 
+  # scale_x_log10() +
+  facet_wrap(~`Site Name`, 2 #, scales="free_y"
+             )
+## TODO: plot mean and median horizontal lines.
+  
+filter(flow2, Site %in% c("02109500", "02173000", "02196000", "02167582")) %>%
+         left_join(surfaceSites, by=c("Site"="site_no")) %>%
+  mutate(`CFS/sqmi` = Flow / `Drainage Area (sqmi)`) %>%
+  ggplot(aes(# group=interaction(Duration, Type),
+             # y=Flow,
+    y=`CFS/sqmi`, 
+    # color=Type, 
+    # x=`Return Interval`, 
+    color=`Exceedance Probability`,
+    x=Duration)) +
+  geom_point() +
+  scale_color_gradient(low="red", high="blue") +
+  scale_y_log10() + 
+  # scale_x_log10() +
+  facet_wrap(~`Site Name`, 2 #, scales="free_y"
+             )
+
+rm(surfaceSites)
+```
+
+```{r NWIS-map}
+## Leaflet map with HUC4s, States, nonWellAndStreamSites
+## catalog stats for each site.
+
+## site table, map, stat table, 
+## when a site is selected, filter map and stat table
+## when an area or site is selected in the map, filter tables
+## when a stat is selected, filter sites and map.
+
+## ggiraph?
+
+### ToDo: Visualize and explore the two sites tables.
+### ToDo: try to find data quality codes.
+### ToDo: filter out data that isn't relevant to the app.
+
+```
+
